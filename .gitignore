@@ -1,5 +1,6 @@
-# Build binary
-specguard
+# Build binary (root only; do not ignore cmd/specguard/)
+/specguard
+/specguard.exe
 bin/
 
 # Database
