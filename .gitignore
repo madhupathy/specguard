@@ -1,4 +1,4 @@
-# Build binary (root only; do not ignore cmd/specguard/)
+# Build binary (root only)
 /specguard
 /specguard.exe
 bin/
@@ -9,8 +9,16 @@ bin/
 *.db-wal
 *.db-shm
 
-# Environment
+# Environment — NEVER commit real credentials
 .env
+.env.local
+.env.*.local
+
+# Private keys — NEVER commit
+*.pem
+*.key
+*.p12
+private-key.pem
 
 # IDE
 .idea/
@@ -32,6 +40,3 @@ web/out/
 
 # SpecGuard output artifacts
 .specguard/out/
-
-# Private keys
-*.pem
