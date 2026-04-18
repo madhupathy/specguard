@@ -2,16 +2,19 @@ package api
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
 	"strconv"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/specguard/specguard/internal/config"
 	"github.com/specguard/specguard/internal/database"
 	"github.com/specguard/specguard/internal/storage"
-	"github.com/gin-gonic/gin"
 )
 
 type Server struct {
@@ -714,19 +717,42 @@ func (s *Server) downloadArtifact(c *gin.Context) {
 	}
 }
 
-// GitHub webhook endpoint (placeholder)
+// GitHub webhook endpoint — HMAC-SHA256 verified
 func (s *Server) handleGitHubWebhook(c *gin.Context) {
-	// TODO: Implement GitHub webhook handling
-	// This will include:
-	// - Signature verification
-	// - Event parsing (pull request, push, etc.)
-	// - Triggering spec loading and diffing
-	// - Generating artifacts
-	// - Posting PR comments
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to read body"})
+		return
+	}
 
-	c.JSON(http.StatusNotImplemented, gin.H{
-		"message": "GitHub webhook handling not yet implemented",
-	})
+	// Verify HMAC-SHA256 signature when secret is configured
+	if s.cfg.GitHub.WebhookSecret != "" {
+		sig := c.GetHeader("X-Hub-Signature-256")
+		if sig == "" {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Missing X-Hub-Signature-256"})
+			return
+		}
+		mac := hmac.New(sha256.New, []byte(s.cfg.GitHub.WebhookSecret))
+		mac.Write(body)
+		expected := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+		if !hmac.Equal([]byte(sig), []byte(expected)) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid signature"})
+			return
+		}
+	}
+
+	event := c.GetHeader("X-GitHub-Event")
+	if event == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing X-GitHub-Event header"})
+		return
+	}
+
+	if event == "ping" {
+		c.JSON(http.StatusOK, gin.H{"message": "pong"})
+		return
+	}
+
+	c.JSON(http.StatusAccepted, gin.H{"message": "Event received", "event": event})
 }
 
 // Middleware

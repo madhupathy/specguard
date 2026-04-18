@@ -19,12 +19,20 @@ var defaultRules = []ClassificationRule{
 	// Parameter rules
 	{KindPrefix: "parameter.removed", Severity: "breaking", ImpactBonus: 8},
 	{KindPrefix: "parameter.added", Severity: "non_breaking", ImpactBonus: 2},
+	{KindPrefix: "parameter.location_changed", Severity: "breaking", ImpactBonus: 10},
+	{KindPrefix: "parameter.type_changed", Severity: "breaking", ImpactBonus: 9},
+	{KindPrefix: "parameter.became_required", Severity: "breaking", ImpactBonus: 8},
+
+	// Request body rules
+	{KindPrefix: "request_body.removed", Severity: "breaking", ImpactBonus: 10},
+	{KindPrefix: "request_body.added", Severity: "potential_breaking", ImpactBonus: 4},
+	{KindPrefix: "request_body.became_required", Severity: "breaking", ImpactBonus: 8},
 
 	// Response rules
 	{KindPrefix: "response.removed", Severity: "breaking", ImpactBonus: 8},
 	{KindPrefix: "response.added", Severity: "non_breaking", ImpactBonus: 1},
 
-	// Schema rules
+	// Schema rules (component + inline)
 	{KindPrefix: "schema.removed", Severity: "breaking", ImpactBonus: 10},
 	{KindPrefix: "schema.added", Severity: "non_breaking", ImpactBonus: 1},
 	{KindPrefix: "property.removed", Severity: "breaking", ImpactBonus: 8},
@@ -33,13 +41,25 @@ var defaultRules = []ClassificationRule{
 	{KindPrefix: "field.became_required", Severity: "breaking", ImpactBonus: 8},
 	{KindPrefix: "field.became_optional", Severity: "non_breaking", ImpactBonus: 2},
 
+	// Enum rules
+	{KindPrefix: "enum.value_removed", Severity: "breaking", ImpactBonus: 10},
+	{KindPrefix: "enum.value_added", Severity: "non_breaking", ImpactBonus: 1},
+	{KindPrefix: "enum.constraint_removed", Severity: "potential_breaking", ImpactBonus: 4},
+
 	// Security rules
 	{KindPrefix: "security.removed", Severity: "breaking", ImpactBonus: 10},
 	{KindPrefix: "security.added", Severity: "potential_breaking", ImpactBonus: 5},
 
-	// Proto rules
+	// Proto service/method rules
 	{KindPrefix: "service.removed", Severity: "breaking", ImpactBonus: 15},
 	{KindPrefix: "service.added", Severity: "non_breaking", ImpactBonus: 1},
+	{KindPrefix: "method.removed", Severity: "breaking", ImpactBonus: 10},
+	{KindPrefix: "method.added", Severity: "non_breaking", ImpactBonus: 1},
+
+	// Proto field rules — field number reuse is the most critical proto breaking change
+	{KindPrefix: "proto.field_number_reused", Severity: "breaking", ImpactBonus: 20},
+	{KindPrefix: "proto.field_removed", Severity: "breaking", ImpactBonus: 12},
+	{KindPrefix: "proto.field_type_changed", Severity: "breaking", ImpactBonus: 12},
 
 	// Snapshot-level entry rules
 	{KindPrefix: "entry.removed", Severity: "breaking", ImpactBonus: 15},

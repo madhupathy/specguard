@@ -1,8 +1,10 @@
 package main
 
 import (
+	"crypto/hmac"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -217,9 +219,7 @@ func (s *apiServer) start(host, port string) error {
 		// Swagger / OpenAPI viewer
 		v1.GET("/repositories/:id/swagger", s.getSwagger)
 
-		v1.POST("/webhooks/github", func(c *gin.Context) {
-			c.JSON(http.StatusNotImplemented, gin.H{"message": "GitHub webhook handling not yet implemented"})
-		})
+		v1.POST("/webhooks/github", s.handleGitHubWebhook)
 	}
 
 	addr := host + ":" + port
@@ -792,7 +792,182 @@ func (s *apiServer) getArtifact(c *gin.Context) {
 }
 
 func (s *apiServer) downloadArtifact(c *gin.Context) {
-	c.JSON(http.StatusNotImplemented, gin.H{"error": "Local artifact download not implemented yet"})
+	idStr := c.Param("id")
+	id, err := strconv.Atoi(idStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid artifact ID"})
+		return
+	}
+
+	var storagePath, format sql.NullString
+	err = s.db.QueryRow(
+		`SELECT storage_path, format FROM artifacts WHERE id = ?`, id,
+	).Scan(&storagePath, &format)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Artifact not found"})
+		return
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
+		return
+	}
+	if !storagePath.Valid || storagePath.String == "" {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Artifact has no stored file"})
+		return
+	}
+
+	f, err := os.Open(storagePath.String)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Artifact file not found on disk"})
+		return
+	}
+	defer f.Close()
+
+	ext := strings.ToLower(filepath.Ext(storagePath.String))
+	contentType := "application/octet-stream"
+	switch ext {
+	case ".json":
+		contentType = "application/json"
+	case ".md":
+		contentType = "text/markdown"
+	case ".html":
+		contentType = "text/html"
+	case ".pdf":
+		contentType = "application/pdf"
+	case ".gz", ".tar.gz":
+		contentType = "application/gzip"
+	case ".zip":
+		contentType = "application/zip"
+	}
+
+	filename := filepath.Base(storagePath.String)
+	c.Header("Content-Type", contentType)
+	c.Header("Content-Disposition", "attachment; filename=\""+filename+"\"")
+	io.Copy(c.Writer, f)
+}
+
+
+// ---------------------------------------------------------------------------
+// GitHub Webhook Handler
+// ---------------------------------------------------------------------------
+
+type githubWebhookPayload struct {
+	Action      string `json:"action"`
+	Number      int    `json:"number"`
+	PullRequest struct {
+		Number int    `json:"number"`
+		Title  string `json:"title"`
+		Head   struct {
+			Ref string `json:"ref"`
+			SHA string `json:"sha"`
+		} `json:"head"`
+		Base struct {
+			Ref string `json:"ref"`
+		} `json:"base"`
+	} `json:"pull_request"`
+	Repository struct {
+		FullName string `json:"full_name"`
+		CloneURL string `json:"clone_url"`
+	} `json:"repository"`
+	Ref    string `json:"ref"`
+	After  string `json:"after"`
+	Before string `json:"before"`
+}
+
+func (s *apiServer) handleGitHubWebhook(c *gin.Context) {
+	// 1. Read raw body for signature verification
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to read request body"})
+		return
+	}
+
+	// 2. Verify HMAC-SHA256 signature if secret is configured
+	secret := os.Getenv("GITHUB_WEBHOOK_SECRET")
+	if secret != "" {
+		sig := c.GetHeader("X-Hub-Signature-256")
+		if sig == "" {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Missing X-Hub-Signature-256 header"})
+			return
+		}
+		mac := hmac.New(sha256.New, []byte(secret))
+		mac.Write(body)
+		expected := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+		if !hmac.Equal([]byte(sig), []byte(expected)) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid webhook signature"})
+			return
+		}
+	}
+
+	// 3. Parse event type
+	event := c.GetHeader("X-GitHub-Event")
+	if event == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing X-GitHub-Event header"})
+		return
+	}
+
+	// 4. Parse payload
+	var payload githubWebhookPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON payload"})
+		return
+	}
+
+	// 5. Route by event type
+	switch event {
+	case "ping":
+		c.JSON(http.StatusOK, gin.H{"message": "pong"})
+
+	case "pull_request":
+		if payload.Action == "opened" || payload.Action == "synchronize" || payload.Action == "reopened" {
+			log.Printf(
+				"GitHub webhook: PR #%d (%s) on %s — head=%s base=%s",
+				payload.PullRequest.Number,
+				payload.PullRequest.Title,
+				payload.Repository.FullName,
+				payload.PullRequest.Head.Ref,
+				payload.PullRequest.Base.Ref,
+			)
+			// Record the event for future CI integration
+			_, _ = s.db.Exec(
+				`INSERT OR IGNORE INTO repositories (name, url) VALUES (?, ?)`,
+				payload.Repository.FullName,
+				payload.Repository.CloneURL,
+			)
+			c.JSON(http.StatusAccepted, gin.H{
+				"message": "Pull request event received",
+				"repo":    payload.Repository.FullName,
+				"pr":      payload.PullRequest.Number,
+				"action":  payload.Action,
+			})
+		} else {
+			c.JSON(http.StatusOK, gin.H{"message": "Event ignored", "action": payload.Action})
+		}
+
+	case "push":
+		if payload.Ref == "refs/heads/main" || payload.Ref == "refs/heads/master" {
+			log.Printf(
+				"GitHub webhook: push to %s on %s (after=%s)",
+				payload.Ref, payload.Repository.FullName, payload.After,
+			)
+			_, _ = s.db.Exec(
+				`INSERT OR IGNORE INTO repositories (name, url) VALUES (?, ?)`,
+				payload.Repository.FullName,
+				payload.Repository.CloneURL,
+			)
+			c.JSON(http.StatusAccepted, gin.H{
+				"message": "Push event received",
+				"repo":    payload.Repository.FullName,
+				"ref":     payload.Ref,
+				"after":   payload.After,
+			})
+		} else {
+			c.JSON(http.StatusOK, gin.H{"message": "Push to non-default branch ignored"})
+		}
+
+	default:
+		c.JSON(http.StatusOK, gin.H{"message": "Event type not handled", "event": event})
+	}
 }
 
 // ---------------------------------------------------------------------------

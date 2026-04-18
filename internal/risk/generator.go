@@ -161,7 +161,14 @@ func buildRiskReport(summary diffSummary, standardsViolations int) ReportPayload
 }
 
 func weightedScore(summary diffSummary, standardsViolations int) int {
-	points := summary.Breaking*30 + summary.PotentialBreaking*15 + summary.Mutations*10 + summary.Removals*15 + summary.DocumentationOnly*5 + standardsViolations*3
+	// Note: breaking already includes field/param removals, enum changes, type changes.
+	// Removals is NOT added separately to avoid double-counting.
+	// Mutations covers non-breaking structural changes (additions, modifications).
+	points := summary.Breaking*30 +
+		summary.PotentialBreaking*12 +
+		summary.Mutations*8 +
+		summary.DocumentationOnly*3 +
+		standardsViolations*2
 	if points > 100 {
 		points = 100
 	}

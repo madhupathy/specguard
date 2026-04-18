@@ -3,27 +3,37 @@
 import { useEffect, useState } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
+import { ArrowLeft, Loader2 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { apiFetch, severityColor } from "@/lib/utils";
-import { ArrowLeft, AlertTriangle, Loader2, Sparkles } from "lucide-react";
+import { apiFetch, severityColor, changeKindLabel, severityIcon } from "@/lib/utils";
+
+interface ChangeDetail {
+  id: number;
+  from_spec_id: number | null;
+  to_spec_id: number | null;
+  change_type: string;
+  classification: string;
+  path: string;
+  description: string | null;
+  ai_summary: string | null;
+  impact_score: number;
+  metadata: string | null;
+  created_at: string;
+}
 
 export default function ChangeDetailPage() {
   const params = useParams();
   const id = params.id as string;
-  const [change, setChange] = useState<any>(null);
+  const [change, setChange] = useState<ChangeDetail | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    async function load() {
-      try {
-        const data = await apiFetch(`/changes/${id}`);
-        setChange(data);
-      } catch {}
-      setLoading(false);
-    }
-    load();
+    if (!id) return;
+    apiFetch<ChangeDetail>(`/changes/${id}`)
+      .then(setChange)
+      .catch(console.error)
+      .finally(() => setLoading(false));
   }, [id]);
 
   if (loading) {
@@ -35,103 +45,77 @@ export default function ChangeDetailPage() {
   }
 
   if (!change) {
-    return <div className="p-8 text-center text-muted-foreground">Change not found</div>;
+    return (
+      <div className="p-8">
+        <p className="text-muted-foreground">Change not found.</p>
+        <Link href="/changes" className="text-primary text-sm mt-2 inline-block">← Back to Changes</Link>
+      </div>
+    );
   }
+
+  let metadata: Record<string, string> = {};
+  try {
+    if (change.metadata) metadata = JSON.parse(change.metadata);
+  } catch {}
 
   return (
     <div className="p-6 lg:p-8 space-y-6">
-      <div className="flex items-center gap-3">
-        <Button variant="ghost" size="icon" asChild>
-          <Link href="/changes"><ArrowLeft className="h-4 w-4" /></Link>
-        </Button>
-        <div className="flex-1">
-          <h1 className="text-2xl font-bold flex items-center gap-2">
-            <AlertTriangle className="h-5 w-5 text-amber-500" />
-            Change #{change.id}
-          </h1>
-          <p className="text-sm text-muted-foreground truncate">{change.path}</p>
+      <div>
+        <Link href="/changes" className="flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground mb-3">
+          <ArrowLeft className="h-4 w-4" /> Back to Changes
+        </Link>
+        <div className="flex items-start gap-3">
+          <span className="text-2xl">{severityIcon(change.change_type)}</span>
+          <div>
+            <h1 className="text-2xl font-bold">{changeKindLabel(change.classification || change.change_type)}</h1>
+            <p className="text-muted-foreground font-mono text-sm mt-1">{change.path}</p>
+          </div>
         </div>
-        <Badge className={`${severityColor(change.change_type)} text-sm px-3 py-1`} variant="outline">
+      </div>
+
+      <div className="flex gap-3 flex-wrap">
+        <Badge className={severityColor(change.change_type)} variant="outline">
           {change.change_type}
         </Badge>
+        {change.classification && change.classification !== change.change_type && (
+          <Badge variant="secondary">{change.classification}</Badge>
+        )}
+        <Badge variant="outline">Impact: {change.impact_score}</Badge>
       </div>
 
-      <div className="grid gap-4 sm:grid-cols-3">
+      {change.description && (
         <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-xs text-muted-foreground">Classification</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <p className="text-sm font-medium">{change.classification}</p>
-          </CardContent>
+          <CardHeader><CardTitle className="text-sm font-semibold">Description</CardTitle></CardHeader>
+          <CardContent><p className="text-sm">{change.description}</p></CardContent>
         </Card>
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-xs text-muted-foreground">Impact Score</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <p className="text-3xl font-bold">{change.impact_score}</p>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-xs text-muted-foreground">Spec IDs</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <p className="text-sm">
-              <span className="text-muted-foreground">From:</span>{" "}
-              <Link href={`/specs/${change.from_spec_id}`} className="text-primary hover:underline">#{change.from_spec_id}</Link>
-              {" → "}
-              <Link href={`/specs/${change.to_spec_id}`} className="text-primary hover:underline">#{change.to_spec_id}</Link>
-            </p>
-          </CardContent>
-        </Card>
-      </div>
-
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-base">Path</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <code className="text-sm bg-muted px-3 py-1.5 rounded-md block">{change.path}</code>
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-base">Description</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <p className="text-sm leading-relaxed">{change.description || "No description available"}</p>
-        </CardContent>
-      </Card>
+      )}
 
       {change.ai_summary && (
-        <Card className="border-purple-200 bg-purple-50/30">
-          <CardHeader>
-            <CardTitle className="text-base flex items-center gap-2">
-              <Sparkles className="h-4 w-4 text-purple-600" />
-              AI Summary
-            </CardTitle>
-          </CardHeader>
+        <Card className="border-blue-200 bg-blue-50/30">
+          <CardHeader><CardTitle className="text-sm font-semibold text-blue-700">AI Summary</CardTitle></CardHeader>
+          <CardContent><p className="text-sm text-blue-800">{change.ai_summary}</p></CardContent>
+        </Card>
+      )}
+
+      {Object.keys(metadata).length > 0 && (
+        <Card>
+          <CardHeader><CardTitle className="text-sm font-semibold">Change Details</CardTitle></CardHeader>
           <CardContent>
-            <p className="text-sm leading-relaxed">{change.ai_summary}</p>
+            <div className="grid grid-cols-2 gap-2">
+              {Object.entries(metadata).map(([k, v]) => (
+                <div key={k} className="text-sm">
+                  <span className="font-medium text-muted-foreground">{k}: </span>
+                  <span className="font-mono">{v}</span>
+                </div>
+              ))}
+            </div>
           </CardContent>
         </Card>
       )}
 
-      {change.metadata && Object.keys(change.metadata).length > 0 && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-base">Metadata</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <pre className="text-xs bg-muted p-4 rounded-lg overflow-x-auto">
-              {JSON.stringify(change.metadata, null, 2)}
-            </pre>
-          </CardContent>
-        </Card>
-      )}
+      <div className="text-xs text-muted-foreground">
+        Detected: {new Date(change.created_at).toLocaleString()}
+      </div>
     </div>
   );
 }

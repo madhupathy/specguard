@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 )
 
@@ -72,11 +73,9 @@ func diffOpenAPIFiles(baseEntry, headEntry SnapshotEntry, repoPath string) []Cha
 	}
 
 	var changes []Change
-
 	changes = append(changes, diffPaths(baseData, headData)...)
 	changes = append(changes, diffSchemas(baseData, headData)...)
 	changes = append(changes, diffSecuritySchemes(baseData, headData)...)
-
 	return changes
 }
 
@@ -96,64 +95,14 @@ func diffProtobufFiles(baseEntry, headEntry SnapshotEntry, repoPath string) []Ch
 	baseFiles := getSlice(baseData, "file")
 	headFiles := getSlice(headData, "file")
 
-	baseServices := extractProtoServices(baseFiles)
-	headServices := extractProtoServices(headFiles)
-
-	for name := range baseServices {
-		if _, ok := headServices[name]; !ok {
-			changes = append(changes, Change{
-				ID:       fmt.Sprintf("proto.service.removed::%s", name),
-				Kind:     "service.removed",
-				Severity: "breaking",
-				Source:   name,
-				Details:  map[string]string{"type": "protobuf", "service": name},
-			})
-		}
-	}
-
-	for name := range headServices {
-		if _, ok := baseServices[name]; !ok {
-			changes = append(changes, Change{
-				ID:       fmt.Sprintf("proto.service.added::%s", name),
-				Kind:     "service.added",
-				Severity: "non_breaking",
-				Source:   name,
-				Details:  map[string]string{"type": "protobuf", "service": name},
-			})
-		}
-	}
-
-	baseMethods := extractProtoMethods(baseFiles)
-	headMethods := extractProtoMethods(headFiles)
-
-	for key := range baseMethods {
-		if _, ok := headMethods[key]; !ok {
-			changes = append(changes, Change{
-				ID:       fmt.Sprintf("proto.method.removed::%s", key),
-				Kind:     "method.removed",
-				Severity: "breaking",
-				Source:   key,
-				Details:  map[string]string{"type": "protobuf", "method": key},
-			})
-		}
-	}
-
-	for key := range headMethods {
-		if _, ok := baseMethods[key]; !ok {
-			changes = append(changes, Change{
-				ID:       fmt.Sprintf("proto.method.added::%s", key),
-				Kind:     "method.added",
-				Severity: "non_breaking",
-				Source:   key,
-				Details:  map[string]string{"type": "protobuf", "method": key},
-			})
-		}
-	}
+	changes = append(changes, diffProtoServices(baseFiles, headFiles)...)
+	changes = append(changes, diffProtoMethods(baseFiles, headFiles)...)
+	changes = append(changes, diffProtoMessages(baseFiles, headFiles)...)
 
 	return changes
 }
 
-// --- OpenAPI deep diff helpers ---
+// --- OpenAPI deep diff ---
 
 func diffPaths(base, head map[string]interface{}) []Change {
 	var changes []Change
@@ -207,26 +156,20 @@ func diffEndpoint(path string, base, head map[string]interface{}) []Change {
 
 		if baseHas && !headHas {
 			changes = append(changes, Change{
-				ID:       fmt.Sprintf("method.removed::%s", fullPath),
-				Kind:     "method.removed",
-				Severity: "breaking",
-				Source:   fullPath,
-				Details:  map[string]string{"type": "openapi", "method": method, "path": path},
+				ID: fmt.Sprintf("method.removed::%s", fullPath), Kind: "method.removed",
+				Severity: "breaking", Source: fullPath,
+				Details: map[string]string{"type": "openapi", "method": method, "path": path},
 			})
 			continue
 		}
-
 		if !baseHas && headHas {
 			changes = append(changes, Change{
-				ID:       fmt.Sprintf("method.added::%s", fullPath),
-				Kind:     "method.added",
-				Severity: "non_breaking",
-				Source:   fullPath,
-				Details:  map[string]string{"type": "openapi", "method": method, "path": path},
+				ID: fmt.Sprintf("method.added::%s", fullPath), Kind: "method.added",
+				Severity: "non_breaking", Source: fullPath,
+				Details: map[string]string{"type": "openapi", "method": method, "path": path},
 			})
 			continue
 		}
-
 		if !baseHas || !headHas {
 			continue
 		}
@@ -246,56 +189,332 @@ func diffEndpoint(path string, base, head map[string]interface{}) []Change {
 func diffMethodDetail(fullPath, method, path string, base, head map[string]interface{}) []Change {
 	var changes []Change
 
-	baseParams := extractParamNames(base)
-	headParams := extractParamNames(head)
+	// --- Parameters ---
+	baseParamMap := extractParamDetails(base)
+	headParamMap := extractParamDetails(head)
 
-	for name := range baseParams {
-		if _, ok := headParams[name]; !ok {
+	for name, baseParam := range baseParamMap {
+		headParam, ok := headParamMap[name]
+		if !ok {
 			changes = append(changes, Change{
 				ID:       fmt.Sprintf("parameter.removed::%s.%s", fullPath, name),
-				Kind:     "parameter.removed",
-				Severity: "breaking",
-				Source:   fullPath,
-				Details:  map[string]string{"type": "openapi", "parameter": name, "method": method, "path": path},
+				Kind:     "parameter.removed", Severity: "breaking", Source: fullPath,
+				Details: map[string]string{"type": "openapi", "parameter": name, "method": method, "path": path},
+			})
+			continue
+		}
+		// Check parameter location change (e.g. path -> query) — always breaking
+		if baseParam["in"] != headParam["in"] && baseParam["in"] != "" && headParam["in"] != "" {
+			changes = append(changes, Change{
+				ID:   fmt.Sprintf("parameter.location_changed::%s.%s", fullPath, name),
+				Kind: "parameter.location_changed", Severity: "breaking", Source: fullPath,
+				Details: map[string]string{
+					"type": "openapi", "parameter": name, "method": method, "path": path,
+					"from_in": baseParam["in"], "to_in": headParam["in"],
+				},
+			})
+		}
+		// Check parameter type change
+		if baseParam["type"] != headParam["type"] && baseParam["type"] != "" && headParam["type"] != "" {
+			changes = append(changes, Change{
+				ID:   fmt.Sprintf("parameter.type_changed::%s.%s", fullPath, name),
+				Kind: "parameter.type_changed", Severity: "breaking", Source: fullPath,
+				Details: map[string]string{
+					"type": "openapi", "parameter": name, "method": method, "path": path,
+					"from_type": baseParam["type"], "to_type": headParam["type"],
+				},
+			})
+		}
+		// Check required change (optional -> required is breaking)
+		if baseParam["required"] != "true" && headParam["required"] == "true" {
+			changes = append(changes, Change{
+				ID:   fmt.Sprintf("parameter.became_required::%s.%s", fullPath, name),
+				Kind: "parameter.became_required", Severity: "breaking", Source: fullPath,
+				Details: map[string]string{"type": "openapi", "parameter": name, "method": method, "path": path},
 			})
 		}
 	}
 
-	for name := range headParams {
-		if _, ok := baseParams[name]; !ok {
+	for name := range headParamMap {
+		if _, ok := baseParamMap[name]; !ok {
 			changes = append(changes, Change{
 				ID:       fmt.Sprintf("parameter.added::%s.%s", fullPath, name),
-				Kind:     "parameter.added",
-				Severity: "non_breaking",
-				Source:   fullPath,
-				Details:  map[string]string{"type": "openapi", "parameter": name, "method": method, "path": path},
+				Kind:     "parameter.added", Severity: "non_breaking", Source: fullPath,
+				Details: map[string]string{"type": "openapi", "parameter": name, "method": method, "path": path},
 			})
 		}
 	}
 
+	// --- Request body schema ---
+	changes = append(changes, diffRequestBody(fullPath, method, path, base, head)...)
+
+	// --- Responses ---
 	baseResponses := getMap(base, "responses")
 	headResponses := getMap(head, "responses")
 
 	for code := range baseResponses {
 		if _, ok := headResponses[code]; !ok {
 			changes = append(changes, Change{
-				ID:       fmt.Sprintf("response.removed::%s.%s", fullPath, code),
-				Kind:     "response.removed",
-				Severity: "breaking",
-				Source:   fullPath,
-				Details:  map[string]string{"type": "openapi", "status_code": code, "method": method, "path": path},
+				ID:   fmt.Sprintf("response.removed::%s.%s", fullPath, code),
+				Kind: "response.removed", Severity: "breaking", Source: fullPath,
+				Details: map[string]string{"type": "openapi", "status_code": code, "method": method, "path": path},
+			})
+		}
+	}
+	for code := range headResponses {
+		if _, ok := baseResponses[code]; !ok {
+			changes = append(changes, Change{
+				ID:   fmt.Sprintf("response.added::%s.%s", fullPath, code),
+				Kind: "response.added", Severity: "non_breaking", Source: fullPath,
+				Details: map[string]string{"type": "openapi", "status_code": code, "method": method, "path": path},
 			})
 		}
 	}
 
-	for code := range headResponses {
-		if _, ok := baseResponses[code]; !ok {
+	// Diff response schemas for existing codes
+	for code, baseRespVal := range baseResponses {
+		headRespVal, ok := headResponses[code]
+		if !ok {
+			continue
+		}
+		baseResp := asMap(baseRespVal)
+		headResp := asMap(headRespVal)
+		if baseResp == nil || headResp == nil {
+			continue
+		}
+		changes = append(changes, diffResponseSchema(fullPath, method, path, code, baseResp, headResp)...)
+	}
+
+	return changes
+}
+
+// diffRequestBody detects schema changes in requestBody.
+func diffRequestBody(fullPath, method, path string, base, head map[string]interface{}) []Change {
+	var changes []Change
+
+	baseBody := asMap(base["requestBody"])
+	headBody := asMap(head["requestBody"])
+
+	if baseBody == nil && headBody == nil {
+		return nil
+	}
+	if baseBody != nil && headBody == nil {
+		return []Change{{
+			ID:   fmt.Sprintf("requestbody.removed::%s", fullPath),
+			Kind: "request_body.removed", Severity: "breaking", Source: fullPath,
+			Details: map[string]string{"type": "openapi", "method": method, "path": path},
+		}}
+	}
+	if baseBody == nil && headBody != nil {
+		return []Change{{
+			ID:   fmt.Sprintf("requestbody.added::%s", fullPath),
+			Kind: "request_body.added", Severity: "potential_breaking", Source: fullPath,
+			Details: map[string]string{"type": "openapi", "method": method, "path": path},
+		}}
+	}
+
+	// Check required flag
+	baseRequired, _ := baseBody["required"].(bool)
+	headRequired, _ := headBody["required"].(bool)
+	if !baseRequired && headRequired {
+		changes = append(changes, Change{
+			ID:   fmt.Sprintf("requestbody.became_required::%s", fullPath),
+			Kind: "request_body.became_required", Severity: "breaking", Source: fullPath,
+			Details: map[string]string{"type": "openapi", "method": method, "path": path},
+		})
+	}
+
+	// Diff inline schema properties within requestBody content
+	baseContent := getMap(baseBody, "content")
+	headContent := getMap(headBody, "content")
+	for mediaType, baseMediaVal := range baseContent {
+		headMediaVal, ok := headContent[mediaType]
+		if !ok {
+			continue
+		}
+		baseMedia := asMap(baseMediaVal)
+		headMedia := asMap(headMediaVal)
+		if baseMedia == nil || headMedia == nil {
+			continue
+		}
+		baseSchema := asMap(baseMedia["schema"])
+		headSchema := asMap(headMedia["schema"])
+		if baseSchema == nil || headSchema == nil {
+			continue
+		}
+		schemaChanges := diffInlineSchema(
+			fmt.Sprintf("requestBody(%s)", mediaType),
+			fullPath, method, path,
+			baseSchema, headSchema,
+		)
+		changes = append(changes, schemaChanges...)
+	}
+
+	return changes
+}
+
+// diffResponseSchema diffs the response schema for a specific status code.
+func diffResponseSchema(fullPath, method, path, code string, baseResp, headResp map[string]interface{}) []Change {
+	var changes []Change
+	baseContent := getMap(baseResp, "content")
+	headContent := getMap(headResp, "content")
+	for mediaType, baseMediaVal := range baseContent {
+		headMediaVal, ok := headContent[mediaType]
+		if !ok {
+			continue
+		}
+		baseMedia := asMap(baseMediaVal)
+		headMedia := asMap(headMediaVal)
+		if baseMedia == nil || headMedia == nil {
+			continue
+		}
+		baseSchema := asMap(baseMedia["schema"])
+		headSchema := asMap(headMedia["schema"])
+		if baseSchema == nil || headSchema == nil {
+			continue
+		}
+		schemaChanges := diffInlineSchema(
+			fmt.Sprintf("response[%s](%s)", code, mediaType),
+			fullPath, method, path,
+			baseSchema, headSchema,
+		)
+		changes = append(changes, schemaChanges...)
+	}
+	return changes
+}
+
+// diffInlineSchema checks properties, required fields, and enum values in an inline schema.
+func diffInlineSchema(context, fullPath, method, path string, base, head map[string]interface{}) []Change {
+	var changes []Change
+
+	baseProps := getMap(base, "properties")
+	headProps := getMap(head, "properties")
+
+	for prop := range baseProps {
+		if _, ok := headProps[prop]; !ok {
 			changes = append(changes, Change{
-				ID:       fmt.Sprintf("response.added::%s.%s", fullPath, code),
-				Kind:     "response.added",
-				Severity: "non_breaking",
-				Source:   fullPath,
-				Details:  map[string]string{"type": "openapi", "status_code": code, "method": method, "path": path},
+				ID:   fmt.Sprintf("inline_schema.property.removed::%s.%s.%s", fullPath, context, prop),
+				Kind: "property.removed", Severity: "breaking", Source: fullPath,
+				Details: map[string]string{
+					"type": "openapi", "context": context,
+					"property": prop, "method": method, "path": path,
+				},
+			})
+		}
+	}
+
+	for prop := range headProps {
+		if _, ok := baseProps[prop]; !ok {
+			changes = append(changes, Change{
+				ID:   fmt.Sprintf("inline_schema.property.added::%s.%s.%s", fullPath, context, prop),
+				Kind: "property.added", Severity: "non_breaking", Source: fullPath,
+				Details: map[string]string{
+					"type": "openapi", "context": context,
+					"property": prop, "method": method, "path": path,
+				},
+			})
+		}
+	}
+
+	// Prop type and enum changes
+	for prop, basePropVal := range baseProps {
+		headPropVal, ok := headProps[prop]
+		if !ok {
+			continue
+		}
+		baseProp := asMap(basePropVal)
+		headProp := asMap(headPropVal)
+		if baseProp == nil || headProp == nil {
+			continue
+		}
+		bType, _ := baseProp["type"].(string)
+		hType, _ := headProp["type"].(string)
+		if bType != "" && hType != "" && bType != hType {
+			changes = append(changes, Change{
+				ID:   fmt.Sprintf("inline_schema.property.type_changed::%s.%s.%s", fullPath, context, prop),
+				Kind: "property.type_changed", Severity: "breaking", Source: fullPath,
+				Details: map[string]string{
+					"type": "openapi", "context": context,
+					"property": prop, "from_type": bType, "to_type": hType,
+				},
+			})
+		}
+		// Enum changes
+		changes = append(changes, diffEnumValues(fullPath, context, prop, baseProp, headProp)...)
+	}
+
+	// Required field changes
+	baseRequired := toSet(getStringSlice(base, "required"))
+	headRequired := toSet(getStringSlice(head, "required"))
+	for field := range headRequired {
+		if _, ok := baseRequired[field]; !ok {
+			changes = append(changes, Change{
+				ID:   fmt.Sprintf("inline_schema.field.required::%s.%s.%s", fullPath, context, field),
+				Kind: "field.became_required", Severity: "breaking", Source: fullPath,
+				Details: map[string]string{"type": "openapi", "context": context, "field": field},
+			})
+		}
+	}
+	for field := range baseRequired {
+		if _, ok := headRequired[field]; !ok {
+			changes = append(changes, Change{
+				ID:   fmt.Sprintf("inline_schema.field.optional::%s.%s.%s", fullPath, context, field),
+				Kind: "field.became_optional", Severity: "non_breaking", Source: fullPath,
+				Details: map[string]string{"type": "openapi", "context": context, "field": field},
+			})
+		}
+	}
+
+	return changes
+}
+
+// diffEnumValues detects enum value removals (breaking) and additions (non-breaking).
+func diffEnumValues(fullPath, context, prop string, baseProp, headProp map[string]interface{}) []Change {
+	var changes []Change
+
+	baseEnumRaw, hasBaseEnum := baseProp["enum"]
+	headEnumRaw, hasHeadEnum := headProp["enum"]
+
+	if !hasBaseEnum && !hasHeadEnum {
+		return nil
+	}
+	if hasBaseEnum && !hasHeadEnum {
+		// Removing enum constraint entirely — could be loosening or breaking depending on context
+		changes = append(changes, Change{
+			ID:   fmt.Sprintf("enum.constraint_removed::%s.%s.%s", fullPath, context, prop),
+			Kind: "enum.constraint_removed", Severity: "potential_breaking", Source: fullPath,
+			Details: map[string]string{"type": "openapi", "property": prop, "context": context},
+		})
+		return changes
+	}
+
+	baseEnum := toStringSet(baseEnumRaw)
+	headEnum := toStringSet(headEnumRaw)
+
+	// Removed enum values = BREAKING (clients may be sending/expecting removed values)
+	for v := range baseEnum {
+		if _, ok := headEnum[v]; !ok {
+			changes = append(changes, Change{
+				ID:   fmt.Sprintf("enum.value_removed::%s.%s.%s.%s", fullPath, context, prop, v),
+				Kind: "enum.value_removed", Severity: "breaking", Source: fullPath,
+				Details: map[string]string{
+					"type": "openapi", "property": prop, "context": context,
+					"removed_value": v,
+				},
+			})
+		}
+	}
+
+	// Added enum values = non-breaking (new valid value)
+	for v := range headEnum {
+		if _, ok := baseEnum[v]; !ok {
+			changes = append(changes, Change{
+				ID:   fmt.Sprintf("enum.value_added::%s.%s.%s.%s", fullPath, context, prop, v),
+				Kind: "enum.value_added", Severity: "non_breaking", Source: fullPath,
+				Details: map[string]string{
+					"type": "openapi", "property": prop, "context": context,
+					"added_value": v,
+				},
 			})
 		}
 	}
@@ -312,11 +531,9 @@ func diffSchemas(base, head map[string]interface{}) []Change {
 	for name := range baseSchemas {
 		if _, ok := headSchemas[name]; !ok {
 			changes = append(changes, Change{
-				ID:       fmt.Sprintf("schema.removed::%s", name),
-				Kind:     "schema.removed",
-				Severity: "breaking",
-				Source:   fmt.Sprintf("components.schemas.%s", name),
-				Details:  map[string]string{"type": "openapi", "schema": name},
+				ID: fmt.Sprintf("schema.removed::%s", name), Kind: "schema.removed",
+				Severity: "breaking", Source: fmt.Sprintf("components.schemas.%s", name),
+				Details: map[string]string{"type": "openapi", "schema": name},
 			})
 			continue
 		}
@@ -331,11 +548,9 @@ func diffSchemas(base, head map[string]interface{}) []Change {
 	for name := range headSchemas {
 		if _, ok := baseSchemas[name]; !ok {
 			changes = append(changes, Change{
-				ID:       fmt.Sprintf("schema.added::%s", name),
-				Kind:     "schema.added",
-				Severity: "non_breaking",
-				Source:   fmt.Sprintf("components.schemas.%s", name),
-				Details:  map[string]string{"type": "openapi", "schema": name},
+				ID: fmt.Sprintf("schema.added::%s", name), Kind: "schema.added",
+				Severity: "non_breaking", Source: fmt.Sprintf("components.schemas.%s", name),
+				Details: map[string]string{"type": "openapi", "schema": name},
 			})
 		}
 	}
@@ -346,32 +561,26 @@ func diffSchemas(base, head map[string]interface{}) []Change {
 func diffSchema(name string, base, head map[string]interface{}) []Change {
 	var changes []Change
 
-	baseRequired := getStringSlice(base, "required")
-	headRequired := getStringSlice(head, "required")
+	baseRequired := toSet(getStringSlice(base, "required"))
+	headRequired := toSet(getStringSlice(head, "required"))
 
-	baseReqSet := toSet(baseRequired)
-	headReqSet := toSet(headRequired)
-
-	for field := range headReqSet {
-		if _, ok := baseReqSet[field]; !ok {
+	for field := range headRequired {
+		if _, ok := baseRequired[field]; !ok {
 			changes = append(changes, Change{
-				ID:       fmt.Sprintf("schema.field.required::%s.%s", name, field),
-				Kind:     "field.became_required",
-				Severity: "breaking",
-				Source:   fmt.Sprintf("components.schemas.%s.required.%s", name, field),
-				Details:  map[string]string{"type": "openapi", "schema": name, "field": field},
+				ID:   fmt.Sprintf("schema.field.required::%s.%s", name, field),
+				Kind: "field.became_required", Severity: "breaking",
+				Source:  fmt.Sprintf("components.schemas.%s.required.%s", name, field),
+				Details: map[string]string{"type": "openapi", "schema": name, "field": field},
 			})
 		}
 	}
-
-	for field := range baseReqSet {
-		if _, ok := headReqSet[field]; !ok {
+	for field := range baseRequired {
+		if _, ok := headRequired[field]; !ok {
 			changes = append(changes, Change{
-				ID:       fmt.Sprintf("schema.field.optional::%s.%s", name, field),
-				Kind:     "field.became_optional",
-				Severity: "non_breaking",
-				Source:   fmt.Sprintf("components.schemas.%s.required.%s", name, field),
-				Details:  map[string]string{"type": "openapi", "schema": name, "field": field},
+				ID:   fmt.Sprintf("schema.field.optional::%s.%s", name, field),
+				Kind: "field.became_optional", Severity: "non_breaking",
+				Source:  fmt.Sprintf("components.schemas.%s.required.%s", name, field),
+				Details: map[string]string{"type": "openapi", "schema": name, "field": field},
 			})
 		}
 	}
@@ -382,48 +591,48 @@ func diffSchema(name string, base, head map[string]interface{}) []Change {
 	for prop := range baseProps {
 		if _, ok := headProps[prop]; !ok {
 			changes = append(changes, Change{
-				ID:       fmt.Sprintf("schema.property.removed::%s.%s", name, prop),
-				Kind:     "property.removed",
-				Severity: "breaking",
-				Source:   fmt.Sprintf("components.schemas.%s.properties.%s", name, prop),
-				Details:  map[string]string{"type": "openapi", "schema": name, "property": prop},
+				ID:   fmt.Sprintf("schema.property.removed::%s.%s", name, prop),
+				Kind: "property.removed", Severity: "breaking",
+				Source:  fmt.Sprintf("components.schemas.%s.properties.%s", name, prop),
+				Details: map[string]string{"type": "openapi", "schema": name, "property": prop},
 			})
 		}
 	}
-
 	for prop := range headProps {
 		if _, ok := baseProps[prop]; !ok {
 			changes = append(changes, Change{
-				ID:       fmt.Sprintf("schema.property.added::%s.%s", name, prop),
-				Kind:     "property.added",
-				Severity: "non_breaking",
-				Source:   fmt.Sprintf("components.schemas.%s.properties.%s", name, prop),
-				Details:  map[string]string{"type": "openapi", "schema": name, "property": prop},
+				ID:   fmt.Sprintf("schema.property.added::%s.%s", name, prop),
+				Kind: "property.added", Severity: "non_breaking",
+				Source:  fmt.Sprintf("components.schemas.%s.properties.%s", name, prop),
+				Details: map[string]string{"type": "openapi", "schema": name, "property": prop},
 			})
 		}
 	}
 
-	for prop := range baseProps {
-		headProp, ok := headProps[prop]
+	for prop, basePropVal := range baseProps {
+		headPropVal, ok := headProps[prop]
 		if !ok {
 			continue
 		}
-		basePropMap := asMap(baseProps[prop])
-		headPropMap := asMap(headProp)
-		if basePropMap == nil || headPropMap == nil {
+		baseProp := asMap(basePropVal)
+		headProp := asMap(headPropVal)
+		if baseProp == nil || headProp == nil {
 			continue
 		}
-		baseType, _ := basePropMap["type"].(string)
-		headType, _ := headPropMap["type"].(string)
-		if baseType != "" && headType != "" && baseType != headType {
+		bType, _ := baseProp["type"].(string)
+		hType, _ := headProp["type"].(string)
+		if bType != "" && hType != "" && bType != hType {
 			changes = append(changes, Change{
-				ID:       fmt.Sprintf("schema.property.type_changed::%s.%s", name, prop),
-				Kind:     "property.type_changed",
-				Severity: "breaking",
-				Source:   fmt.Sprintf("components.schemas.%s.properties.%s", name, prop),
-				Details:  map[string]string{"type": "openapi", "schema": name, "property": prop, "from_type": baseType, "to_type": headType},
+				ID:   fmt.Sprintf("schema.property.type_changed::%s.%s", name, prop),
+				Kind: "property.type_changed", Severity: "breaking",
+				Source:  fmt.Sprintf("components.schemas.%s.properties.%s", name, prop),
+				Details: map[string]string{"type": "openapi", "schema": name, "property": prop, "from_type": bType, "to_type": hType},
 			})
 		}
+		// Enum changes in component schemas
+		changes = append(changes, diffEnumValues(
+			fmt.Sprintf("components.schemas.%s", name), "component", prop, baseProp, headProp,
+		)...)
 	}
 
 	return changes
@@ -438,23 +647,20 @@ func diffSecuritySchemes(base, head map[string]interface{}) []Change {
 	for name := range baseSec {
 		if _, ok := headSec[name]; !ok {
 			changes = append(changes, Change{
-				ID:       fmt.Sprintf("security.removed::%s", name),
-				Kind:     "security.removed",
-				Severity: "breaking",
-				Source:   fmt.Sprintf("components.securitySchemes.%s", name),
-				Details:  map[string]string{"type": "openapi", "security_scheme": name},
+				ID:   fmt.Sprintf("security.removed::%s", name),
+				Kind: "security.removed", Severity: "breaking",
+				Source:  fmt.Sprintf("components.securitySchemes.%s", name),
+				Details: map[string]string{"type": "openapi", "security_scheme": name},
 			})
 		}
 	}
-
 	for name := range headSec {
 		if _, ok := baseSec[name]; !ok {
 			changes = append(changes, Change{
-				ID:       fmt.Sprintf("security.added::%s", name),
-				Kind:     "security.added",
-				Severity: "potential_breaking",
-				Source:   fmt.Sprintf("components.securitySchemes.%s", name),
-				Details:  map[string]string{"type": "openapi", "security_scheme": name},
+				ID:   fmt.Sprintf("security.added::%s", name),
+				Kind: "security.added", Severity: "potential_breaking",
+				Source:  fmt.Sprintf("components.securitySchemes.%s", name),
+				Details: map[string]string{"type": "openapi", "security_scheme": name},
 			})
 		}
 	}
@@ -462,7 +668,181 @@ func diffSecuritySchemes(base, head map[string]interface{}) []Change {
 	return changes
 }
 
-// --- Proto deep diff helpers ---
+// --- Proto deep diff ---
+
+func diffProtoServices(baseFiles, headFiles []interface{}) []Change {
+	var changes []Change
+	baseServices := extractProtoServices(baseFiles)
+	headServices := extractProtoServices(headFiles)
+
+	for name := range baseServices {
+		if _, ok := headServices[name]; !ok {
+			changes = append(changes, Change{
+				ID:   fmt.Sprintf("proto.service.removed::%s", name),
+				Kind: "service.removed", Severity: "breaking", Source: name,
+				Details: map[string]string{"type": "protobuf", "service": name},
+			})
+		}
+	}
+	for name := range headServices {
+		if _, ok := baseServices[name]; !ok {
+			changes = append(changes, Change{
+				ID:   fmt.Sprintf("proto.service.added::%s", name),
+				Kind: "service.added", Severity: "non_breaking", Source: name,
+				Details: map[string]string{"type": "protobuf", "service": name},
+			})
+		}
+	}
+	return changes
+}
+
+func diffProtoMethods(baseFiles, headFiles []interface{}) []Change {
+	var changes []Change
+	baseMethods := extractProtoMethods(baseFiles)
+	headMethods := extractProtoMethods(headFiles)
+
+	for key := range baseMethods {
+		if _, ok := headMethods[key]; !ok {
+			changes = append(changes, Change{
+				ID:   fmt.Sprintf("proto.method.removed::%s", key),
+				Kind: "method.removed", Severity: "breaking", Source: key,
+				Details: map[string]string{"type": "protobuf", "method": key},
+			})
+		}
+	}
+	for key := range headMethods {
+		if _, ok := baseMethods[key]; !ok {
+			changes = append(changes, Change{
+				ID:   fmt.Sprintf("proto.method.added::%s", key),
+				Kind: "method.added", Severity: "non_breaking", Source: key,
+				Details: map[string]string{"type": "protobuf", "method": key},
+			})
+		}
+	}
+	return changes
+}
+
+// diffProtoMessages checks for field number changes and field removals — the most
+// critical proto breaking changes. Field number reuse or removal corrupts binary encoding.
+func diffProtoMessages(baseFiles, headFiles []interface{}) []Change {
+	var changes []Change
+
+	baseMessages := extractProtoMessageFields(baseFiles)
+	headMessages := extractProtoMessageFields(headFiles)
+
+	for msgName, baseFields := range baseMessages {
+		headFields, ok := headMessages[msgName]
+		if !ok {
+			// Whole message removed — already caught as schema change
+			continue
+		}
+
+		// Index base fields by number
+		baseByNum := map[string]protoField{}
+		baseByName := map[string]protoField{}
+		for _, f := range baseFields {
+			baseByNum[f.Number] = f
+			baseByName[f.Name] = f
+		}
+
+		headByNum := map[string]protoField{}
+		headByName := map[string]protoField{}
+		for _, f := range headFields {
+			headByNum[f.Number] = f
+			headByName[f.Name] = f
+		}
+
+		// Field removed by name
+		for name, bf := range baseByName {
+			if _, ok := headByName[name]; !ok {
+				changes = append(changes, Change{
+					ID:   fmt.Sprintf("proto.field.removed::%s.%s", msgName, name),
+					Kind: "proto.field_removed", Severity: "breaking",
+					Source: fmt.Sprintf("%s.%s", msgName, name),
+					Details: map[string]string{
+						"type": "protobuf", "message": msgName,
+						"field": name, "field_number": bf.Number,
+					},
+				})
+			}
+		}
+
+		// Field number reuse — most dangerous proto change
+		for num, headField := range headByNum {
+			if baseField, ok := baseByNum[num]; ok {
+				if baseField.Name != headField.Name {
+					changes = append(changes, Change{
+						ID:   fmt.Sprintf("proto.field_number.reused::%s.%s", msgName, num),
+						Kind: "proto.field_number_reused", Severity: "breaking",
+						Source: fmt.Sprintf("%s field_number=%s", msgName, num),
+						Details: map[string]string{
+							"type": "protobuf", "message": msgName, "field_number": num,
+							"old_name": baseField.Name, "new_name": headField.Name,
+						},
+					})
+				}
+				// Field type change
+				if baseField.Type != headField.Type && baseField.Type != "" && headField.Type != "" {
+					changes = append(changes, Change{
+						ID:   fmt.Sprintf("proto.field.type_changed::%s.%s", msgName, headField.Name),
+						Kind: "proto.field_type_changed", Severity: "breaking",
+						Source: fmt.Sprintf("%s.%s", msgName, headField.Name),
+						Details: map[string]string{
+							"type": "protobuf", "message": msgName, "field": headField.Name,
+							"from_type": baseField.Type, "to_type": headField.Type,
+						},
+					})
+				}
+			}
+		}
+	}
+
+	return changes
+}
+
+type protoField struct {
+	Name   string
+	Number string
+	Type   string
+}
+
+func extractProtoMessageFields(files []interface{}) map[string][]protoField {
+	messages := map[string][]protoField{}
+	for _, f := range files {
+		fm := asMap(f)
+		if fm == nil {
+			continue
+		}
+		pkg, _ := fm["package"].(string)
+		for _, mt := range getSlice(fm, "messageType") {
+			mm := asMap(mt)
+			if mm == nil {
+				continue
+			}
+			name, _ := mm["name"].(string)
+			if name == "" {
+				continue
+			}
+			fullName := name
+			if pkg != "" {
+				fullName = pkg + "." + name
+			}
+			var fields []protoField
+			for _, fld := range getSlice(mm, "field") {
+				fm2 := asMap(fld)
+				if fm2 == nil {
+					continue
+				}
+				fName, _ := fm2["name"].(string)
+				fNum := fmt.Sprintf("%v", fm2["number"])
+				fType := fmt.Sprintf("%v", fm2["type"])
+				fields = append(fields, protoField{Name: fName, Number: fNum, Type: fType})
+			}
+			messages[fullName] = fields
+		}
+	}
+	return messages
+}
 
 func extractProtoServices(files []interface{}) map[string]bool {
 	services := map[string]bool{}
@@ -574,16 +954,28 @@ func getStringSlice(data map[string]interface{}, key string) []string {
 	return out
 }
 
-func extractParamNames(method map[string]interface{}) map[string]bool {
-	params := map[string]bool{}
+// extractParamDetails returns a map of param name → {in, type, required}
+func extractParamDetails(method map[string]interface{}) map[string]map[string]string {
+	params := map[string]map[string]string{}
 	for _, p := range getSlice(method, "parameters") {
 		pm := asMap(p)
 		if pm == nil {
 			continue
 		}
-		if name, ok := pm["name"].(string); ok {
-			params[name] = true
+		name, ok := pm["name"].(string)
+		if !ok || name == "" {
+			continue
 		}
+		in, _ := pm["in"].(string)
+		required := "false"
+		if r, ok := pm["required"].(bool); ok && r {
+			required = "true"
+		}
+		typStr := ""
+		if schema := asMap(pm["schema"]); schema != nil {
+			typStr, _ = schema["type"].(string)
+		}
+		params[name] = map[string]string{"in": in, "type": typStr, "required": required}
 	}
 	return params
 }
@@ -594,4 +986,30 @@ func toSet(items []string) map[string]bool {
 		s[item] = true
 	}
 	return s
+}
+
+func toStringSet(v interface{}) map[string]bool {
+	s := map[string]bool{}
+	arr, ok := v.([]interface{})
+	if !ok {
+		return s
+	}
+	for _, item := range arr {
+		if str, ok := item.(string); ok {
+			s[str] = true
+		} else {
+			s[fmt.Sprintf("%v", item)] = true
+		}
+	}
+	return s
+}
+
+// sortedKeys returns map keys in sorted order (for deterministic output).
+func sortedKeys(m map[string]interface{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }

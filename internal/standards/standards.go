@@ -52,6 +52,9 @@ func Analyze(specPath string) (Report, error) {
 		ruleNullableOptionalDiscipline,
 		ruleHTTPStatusCoverage,
 		ruleDeprecationMarkers,
+		ruleEnumDocumentation,
+		ruleSunsetHeaderOnDeprecated,
+		ruleRequestBodyContentType,
 	}
 
 	for _, rule := range rules {
@@ -158,17 +161,22 @@ func rulePaginationConsistency(spec map[string]interface{}) []Violation {
 		}
 	}
 
-	if len(paginationStyles) > 1 {
+	// Only flag if 3+ list endpoints use inconsistent pagination styles
+	totalPaginatedEndpoints := 0
+	for _, count := range paginationStyles {
+		totalPaginatedEndpoints += count
+	}
+	if len(paginationStyles) > 1 && totalPaginatedEndpoints >= 3 {
 		styles := []string{}
-		for s := range paginationStyles {
-			styles = append(styles, s)
+		for s, count := range paginationStyles {
+			styles = append(styles, fmt.Sprintf("%s (%d)", s, count))
 		}
 		violations = append(violations, Violation{
 			RuleID:      "STD-002",
 			RuleName:    "Pagination consistency",
 			Severity:    "medium",
 			Path:        "(global)",
-			Description: fmt.Sprintf("Multiple pagination styles detected: %s", strings.Join(styles, ", ")),
+			Description: fmt.Sprintf("Multiple pagination styles detected across %d list endpoints: %s", totalPaginatedEndpoints, strings.Join(styles, ", ")),
 			Remediation: "Standardize on a single pagination approach (offset/limit, cursor, or page/pageSize).",
 		})
 	}
@@ -493,6 +501,125 @@ func ruleDeprecationMarkers(spec map[string]interface{}) []Violation {
 						Remediation: "Add sunset date or migration instructions to the description.",
 					})
 				}
+			}
+		}
+	}
+	return violations
+}
+
+
+// --- Rule 11: Enum values documented ---
+func ruleEnumDocumentation(spec map[string]interface{}) []Violation {
+	var violations []Violation
+	schemas := getNestedMap(spec, "components", "schemas")
+	for schemaName, schemaVal := range schemas {
+		schema := asMap(schemaVal)
+		if schema == nil {
+			continue
+		}
+		props := getMap(schema, "properties")
+		for propName, propVal := range props {
+			prop := asMap(propVal)
+			if prop == nil {
+				continue
+			}
+			enumVals := getSlice(prop, "enum")
+			if len(enumVals) == 0 {
+				continue
+			}
+			// Enum exists but no description on the property
+			desc, _ := prop["description"].(string)
+			if desc == "" {
+				violations = append(violations, Violation{
+					RuleID:      "STD-011",
+					RuleName:    "Enum documentation",
+					Severity:    "low",
+					Path:        fmt.Sprintf("components.schemas.%s.properties.%s", schemaName, propName),
+					Description: fmt.Sprintf("Enum property has %d values but no description explaining their meaning", len(enumVals)),
+					Remediation: "Add a description explaining each enum value's purpose.",
+				})
+			}
+		}
+	}
+	return violations
+}
+
+// --- Rule 12: Sunset header on deprecated endpoints ---
+func ruleSunsetHeaderOnDeprecated(spec map[string]interface{}) []Violation {
+	var violations []Violation
+	paths := getMap(spec, "paths")
+	for path, pathVal := range paths {
+		pathInfo := asMap(pathVal)
+		if pathInfo == nil {
+			continue
+		}
+		for _, method := range httpMethods {
+			methodInfo := asMap(pathInfo[method])
+			if methodInfo == nil {
+				continue
+			}
+			deprecated, _ := methodInfo["deprecated"].(bool)
+			if !deprecated {
+				continue
+			}
+			// Check for Sunset header in responses
+			hasSunsetHeader := false
+			for _, respVal := range getMap(methodInfo, "responses") {
+				resp := asMap(respVal)
+				if resp == nil {
+					continue
+				}
+				headers := getMap(resp, "headers")
+				for headerName := range headers {
+					if strings.EqualFold(headerName, "Sunset") || strings.EqualFold(headerName, "Deprecation") {
+						hasSunsetHeader = true
+						break
+					}
+				}
+			}
+			if !hasSunsetHeader {
+				violations = append(violations, Violation{
+					RuleID:      "STD-012",
+					RuleName:    "Sunset header on deprecated",
+					Severity:    "low",
+					Path:        fmt.Sprintf("%s %s", strings.ToUpper(method), path),
+					Description: "Deprecated endpoint does not advertise a Sunset or Deprecation response header",
+					Remediation: "Add a Sunset response header per RFC 8594 to signal the endpoint removal date.",
+				})
+			}
+		}
+	}
+	return violations
+}
+
+// --- Rule 13: Request body content type ---
+func ruleRequestBodyContentType(spec map[string]interface{}) []Violation {
+	var violations []Violation
+	paths := getMap(spec, "paths")
+	for path, pathVal := range paths {
+		pathInfo := asMap(pathVal)
+		if pathInfo == nil {
+			continue
+		}
+		for _, method := range []string{"post", "put", "patch"} {
+			methodInfo := asMap(pathInfo[method])
+			if methodInfo == nil {
+				continue
+			}
+			body := asMap(methodInfo["requestBody"])
+			if body == nil {
+				continue
+			}
+			content := getMap(body, "content")
+			if len(content) == 0 {
+				violations = append(violations, Violation{
+					RuleID:      "STD-013",
+					RuleName:    "Request body content type",
+					Severity:    "medium",
+					Path:        fmt.Sprintf("%s %s requestBody", strings.ToUpper(method), path),
+					Description: "Request body defined but no content types specified",
+					Remediation: "Specify at least one content type (e.g. application/json) in requestBody.content.",
+				})
 			}
 		}
 	}
